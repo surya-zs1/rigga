@@ -1,73 +1,151 @@
 import os
-import subprocess
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import asyncio
 
-TOKEN = os.environ.get("BOT_TOKEN")
+from telegram import Update,InlineKeyboardButton,InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder,CommandHandler,CallbackQueryHandler,ContextTypes
 
-DOWNLOAD_DIR = "/downloads"
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Send /leech <url>")
+from downloader import get_formats,download_video
+from database import get_cached,save_cache
+from utils import progress_bar
 
 
-async def leech(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = context.args[0]
+TOKEN=os.environ["BOT_TOKEN"]
 
-    msg = await update.message.reply_text("Downloading...")
+DOWNLOAD_DIR="/downloads"
 
-    cmd = ["aria2c", "-d", DOWNLOAD_DIR, url]
-    subprocess.run(cmd)
+user_links={}
+cancel_flags={}
 
-    files = os.listdir(DOWNLOAD_DIR)
 
-    if not files:
-        await msg.edit_text("Download failed")
+async def start(update:Update,context:ContextTypes.DEFAULT_TYPE):
+
+    await update.message.reply_text(
+        "Use /yt <url> to download video"
+    )
+
+
+async def yt(update:Update,context:ContextTypes.DEFAULT_TYPE):
+
+    url=context.args[0]
+
+    cached=await get_cached(url)
+
+    if cached:
+
+        await update.message.reply_document(cached["file_id"])
         return
 
-    file_path = os.path.join(DOWNLOAD_DIR, files[0])
+    formats=get_formats(url)
 
-    await msg.edit_text("Uploading...")
+    buttons=[]
 
-    await update.message.reply_document(document=open(file_path, "rb"))
+    for f in formats:
 
-    os.remove(file_path)
+        buttons.append([
+            InlineKeyboardButton(
+                f["res"],
+                callback_data=f"format|{f['id']}"
+            )
+        ])
+
+    user_links[update.effective_user.id]=url
+
+    await update.message.reply_text(
+        "Select resolution",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
 
 
-async def ytdl(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = context.args[0]
+async def button(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
-    msg = await update.message.reply_text("Downloading video...")
+    query=update.callback_query
+    await query.answer()
 
-    cmd = [
-        "yt-dlp",
-        "-o",
-        f"{DOWNLOAD_DIR}/%(title)s.%(ext)s",
-        url
-    ]
+    data=query.data
 
-    subprocess.run(cmd)
+    if data=="cancel":
 
-    files = os.listdir(DOWNLOAD_DIR)
+        cancel_flags[query.from_user.id]=True
 
-    if not files:
-        await msg.edit_text("Download failed")
+        await query.message.edit_text("Download cancelled")
+
         return
 
-    file_path = os.path.join(DOWNLOAD_DIR, files[0])
 
-    await msg.edit_text("Uploading...")
+    if data.startswith("format"):
 
-    await update.message.reply_document(document=open(file_path, "rb"))
+        format_id=data.split("|")[1]
 
-    os.remove(file_path)
+        user_id=query.from_user.id
+
+        url=user_links[user_id]
+
+        msg=await query.message.reply_text("Starting download...")
 
 
-app = ApplicationBuilder().token(TOKEN).build()
+        cancel_flags[user_id]=False
 
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("leech", leech))
-app.add_handler(CommandHandler("yt", ytdl))
+        loop=asyncio.get_event_loop()
+
+
+        def progress(percent,speed,eta):
+
+            if cancel_flags.get(user_id):
+
+                raise Exception("Cancelled")
+
+            text=f"""
+Downloading
+
+{progress_bar(percent)}
+
+Speed: {speed}
+ETA: {eta}
+"""
+
+            asyncio.run_coroutine_threadsafe(
+                msg.edit_text(
+                    text,
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("Cancel","cancel")]]
+                    )
+                ),
+                loop
+            )
+
+
+        try:
+
+            await loop.run_in_executor(
+                None,
+                download_video,
+                url,
+                format_id,
+                progress
+            )
+
+        except:
+
+            return
+
+
+        file=os.listdir(DOWNLOAD_DIR)[0]
+
+        path=os.path.join(DOWNLOAD_DIR,file)
+
+        sent=await query.message.reply_document(open(path,"rb"))
+
+        await save_cache(url,sent.document.file_id)
+
+        os.remove(path)
+
+        await msg.delete()
+
+
+app=ApplicationBuilder().token(TOKEN).build()
+
+app.add_handler(CommandHandler("start",start))
+app.add_handler(CommandHandler("yt",yt))
+app.add_handler(CallbackQueryHandler(button))
 
 app.run_polling()
